@@ -1,7 +1,8 @@
+import os
 import telebot
 from telebot import types
 
-# Inserisci qui il token del bot
+# Token del bot preso dalle variabili di ambiente
 TOKEN = os.getenv("BOT_TOKEN")
 
 bot = telebot.TeleBot(TOKEN)
@@ -9,7 +10,7 @@ bot = telebot.TeleBot(TOKEN)
 # Canale dove pubblicare gli aggiornamenti
 CHANNEL_ID = "@FRONTE_MERIDIONALE"
 
-# Inserisci il tuo user id dopo aver usato /id
+# Utenti autorizzati a pubblicare nel canale
 AUTHORIZED_USERS = {1685607625}
 
 
@@ -18,24 +19,18 @@ AUTHORIZED_USERS = {1685607625}
 def testo_centrale():
     return (
         "⚑ FRONTE MERIDIONALE ⚑\n\n"
-
         "Il Fronte Meridionale nasce con l'obiettivo di costruire "
         "un'organizzazione politica autonoma, moderna e radicata sul territorio, "
         "capace di rappresentare realmente gli interessi del Mezzogiorno.\n\n"
-
         "Per troppo tempo il Mezzogiorno è stato amministrato da strutture politiche "
         "nazionali che hanno limitato ogni reale alternativa di sviluppo, "
         "sottraendo risorse ai territori e alimentando sistemi decisionali "
         "poco trasparenti.\n\n"
-
         "Il nostro obiettivo è superare questo modello costruendo "
         "una nuova realtà politica fondata sulla partecipazione dei cittadini "
         "e sulla responsabilità nella gestione delle risorse pubbliche.\n\n"
-
         "TESORERIA PUBBLICA E VERIFICABILE\n\n"
-
         "Ogni donazione è consultabile da chiunque.\n\n"
-
         "SOSTIENI IL FRONTE MERIDIONALE"
     )
 
@@ -58,7 +53,7 @@ def tastiera_donazione():
 
 # ---------- START BOT ----------
 
-@bot.message_handler(commands=['start'])
+@bot.message_handler(commands=["start"])
 def start(message):
 
     bot.send_message(
@@ -88,7 +83,7 @@ def risposta_pulsanti(call):
 
 # ---------- COMANDO POST (SOLO ADMIN) ----------
 
-@bot.message_handler(commands=['post'])
+@bot.message_handler(commands=["post"])
 def post_canale(message):
 
     user_id = message.from_user.id
@@ -97,7 +92,7 @@ def post_canale(message):
         bot.reply_to(message, "Non sei autorizzato.")
         return
 
-    testo = message.text.replace("/post", "").strip()
+    testo = message.text.replace("/post", "", 1).strip()
 
     if testo == "":
         bot.reply_to(message, "Inserisci il testo dopo /post")
@@ -110,7 +105,7 @@ def post_canale(message):
 
 # ---------- COMANDO ID ----------
 
-@bot.message_handler(commands=['id'])
+@bot.message_handler(commands=["id"])
 def id_utente(message):
 
     bot.reply_to(message, f"Il tuo user ID è: {message.from_user.id}")
