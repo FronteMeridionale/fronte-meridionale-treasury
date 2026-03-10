@@ -144,7 +144,7 @@ def build_widget_payload(
     }
 
     if fiat_amount:
-        widget_params["fiatAmount"] = fiat_amount
+        widget_params["fiatAmount"] = str(fiat_amount)
         widget_params["fiatCurrency"] = fiat_currency
 
     if partner_customer_id:

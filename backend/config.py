@@ -60,8 +60,9 @@ REFERRER_DOMAIN: str = os.getenv(
 
 # ── Token cache ───────────────────────────────────────────────────────────────
 
-# Partner access token TTL in seconds (default: 6 days)
-TOKEN_CACHE_TTL_SECONDS: int = int(os.getenv("TOKEN_CACHE_TTL_SECONDS", str(6 * 24 * 60 * 60)))
+# Partner access token TTL in seconds (default: 6 days = 518 400 s)
+_TOKEN_CACHE_TTL_DEFAULT = 518_400
+TOKEN_CACHE_TTL_SECONDS: int = int(os.getenv("TOKEN_CACHE_TTL_SECONDS", str(_TOKEN_CACHE_TTL_DEFAULT)))
 
 # ── Rate limiting ─────────────────────────────────────────────────────────────
 
