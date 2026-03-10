@@ -2,3 +2,6 @@ pyTelegramBotAPI
 flask
 requests
 python-dotenv
+pydantic>=2.11
+flask-limiter>=4.1
+flask-cors>=6.0
