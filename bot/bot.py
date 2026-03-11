@@ -42,7 +42,7 @@ def testo_centrale():
 def tastiera_donazione():
     keyboard = types.InlineKeyboardMarkup(row_width=2)
 
-    btn1 = types.InlineKeyboardButton("Dona 15€", callback_data="donazione_15")
+    btn1 = types.InlineKeyboardButton("Dona 20€", callback_data="donazione_20")
     btn2 = types.InlineKeyboardButton("Dona 30€", callback_data="donazione_30")
     btn3 = types.InlineKeyboardButton("Dona 50€", callback_data="donazione_50")
     btn4 = types.InlineKeyboardButton("Donazione libera", callback_data="donazione_libera")
@@ -102,8 +102,8 @@ def start(message):
 def risposta_pulsanti(call):
     chat_id = call.message.chat.id
 
-    if call.data == "donazione_15":
-        crea_link_donazione(chat_id, "15")
+    if call.data == "donazione_20":
+        crea_link_donazione(chat_id, "20")
 
     elif call.data == "donazione_30":
         crea_link_donazione(chat_id, "30")
