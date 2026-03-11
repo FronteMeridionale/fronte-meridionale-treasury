@@ -17,7 +17,6 @@ bot = telebot.TeleBot(TOKEN)
 CHANNEL_ID = "@FRONTE_MERIDIONALE"
 AUTHORIZED_USERS = {1685607625}
 
-# utenti in attesa di inserire importo libero
 pending_free_donation = set()
 
 
