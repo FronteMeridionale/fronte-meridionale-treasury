@@ -13,8 +13,15 @@ app = Flask(__name__)
 
 TRANSAK_API_KEY = os.getenv("TRANSAK_API_KEY")
 TRANSAK_API_SECRET = os.getenv("TRANSAK_API_SECRET")
-TREASURY_WALLET = os.getenv("TREASURY_WALLET", "0x57f333c398c9625D84432aBD00871E2d8049cAaC")
-REFERRER_DOMAIN = os.getenv("REFERRER_DOMAIN", "https://frontemeridionale.github.io")
+TREASURY_WALLET = os.getenv(
+    "TREASURY_WALLET",
+    "0x57f333c398c9625D84432aBD00871E2d8049cAaC"
+)
+
+REFERRER_DOMAIN = os.getenv(
+    "REFERRER_DOMAIN",
+    "https://frontemeridionale.github.io"
+)
 
 TRANSAK_REFRESH_TOKEN_URL = os.getenv("TRANSAK_REFRESH_TOKEN_URL", "")
 TRANSAK_CREATE_WIDGET_URL = os.getenv("TRANSAK_CREATE_WIDGET_URL", "")
@@ -51,6 +58,7 @@ def get_partner_access_token(force_refresh: bool = False) -> str:
         json=payload,
         timeout=30,
     )
+
     response.raise_for_status()
 
     data = response.json()
@@ -77,6 +85,7 @@ def build_widget_payload(
     partner_customer_id: Optional[str],
     partner_order_id: Optional[str],
 ) -> dict:
+
     widget_params = {
         "apiKey": TRANSAK_API_KEY,
         "referrerDomain": REFERRER_DOMAIN,
@@ -107,12 +116,13 @@ def create_widget_url(
     partner_customer_id: Optional[str],
     partner_order_id: Optional[str],
 ) -> str:
+
     token = get_partner_access_token()
 
     headers = {
         "accept": "application/json",
         "content-type": "application/json",
-        "authorization": f"Bearer {token}",
+        "access-token": token,
     }
 
     payload = build_widget_payload(
@@ -131,7 +141,8 @@ def create_widget_url(
 
     if response.status_code == 401:
         token = get_partner_access_token(force_refresh=True)
-        headers["authorization"] = f"Bearer {token}"
+        headers["access-token"] = token
+
         response = requests.post(
             TRANSAK_CREATE_WIDGET_URL,
             headers=headers,
@@ -140,9 +151,13 @@ def create_widget_url(
         )
 
     response.raise_for_status()
+
     data = response.json()
 
-    widget_url = data.get("widgetUrl") or data.get("data", {}).get("widgetUrl")
+    widget_url = (
+        data.get("widgetUrl")
+        or data.get("data", {}).get("widgetUrl")
+    )
 
     if not widget_url:
         raise RuntimeError(f"widgetUrl non trovata nella risposta: {data}")
@@ -202,4 +217,8 @@ def transak_widget_url():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=False)
+    app.run(
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "5000")),
+        debug=False,
+    )
