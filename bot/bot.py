@@ -1,11 +1,18 @@
+import logging
 import os
+import requests
 import telebot
 from telebot import types
+
+logging.basicConfig(level=logging.INFO)
 
 # Token del bot preso dalle variabili di ambiente
 TOKEN = os.getenv("BOT_TOKEN")
 
 bot = telebot.TeleBot(TOKEN)
+
+# URL del backend Flask
+BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:5000")
 
 # Canale dove pubblicare gli aggiornamenti
 CHANNEL_ID = "@FRONTE_MERIDIONALE"
@@ -51,6 +58,27 @@ def tastiera_donazione():
     return keyboard
 
 
+# ---------- HELPER: OTTIENI LINK DONAZIONE DAL BACKEND ----------
+
+def ottieni_link_donazione(chat_id: int, fiat_amount: str):
+    try:
+        response = requests.post(
+            f"{BACKEND_URL}/transak/widget-url",
+            json={
+                "fiatAmount": fiat_amount,
+                "fiatCurrency": "EUR",
+                "partnerCustomerId": str(chat_id),
+            },
+            timeout=15,
+        )
+        response.raise_for_status()
+        data = response.json()
+        return data.get("widgetUrl")
+    except Exception as e:
+        logging.error("Errore nel recupero del link donazione: %s", e)
+        return None
+
+
 # ---------- START BOT ----------
 
 @bot.message_handler(commands=["start"])
@@ -65,20 +93,54 @@ def start(message):
 
 # ---------- GESTIONE PULSANTI ----------
 
+IMPORTI = {
+    "donazione_15": "15",
+    "donazione_30": "30",
+    "donazione_50": "50",
+}
+
 @bot.callback_query_handler(func=lambda call: True)
 def risposta_pulsanti(call):
 
-    if call.data == "donazione_15":
-        bot.send_message(call.message.chat.id, "Procedi con la donazione di 15€")
+    chat_id = call.message.chat.id
 
-    elif call.data == "donazione_30":
-        bot.send_message(call.message.chat.id, "Procedi con la donazione di 30€")
-
-    elif call.data == "donazione_50":
-        bot.send_message(call.message.chat.id, "Procedi con la donazione di 50€")
+    if call.data in IMPORTI:
+        importo = IMPORTI[call.data]
+        bot.send_message(chat_id, f"⏳ Sto generando il link per la donazione di {importo}€...")
+        url = ottieni_link_donazione(chat_id, importo)
+        if url:
+            keyboard = types.InlineKeyboardMarkup()
+            keyboard.add(types.InlineKeyboardButton(f"Dona {importo}€ →", url=url))
+            bot.send_message(chat_id, f"✅ Clicca il pulsante per completare la donazione di {importo}€:", reply_markup=keyboard)
+        else:
+            bot.send_message(chat_id, "❌ Impossibile generare il link di donazione. Riprova più tardi.")
 
     elif call.data == "donazione_libera":
-        bot.send_message(call.message.chat.id, "Inserisci l'importo che desideri donare")
+        msg = bot.send_message(chat_id, "💬 Inserisci l'importo in euro che desideri donare (es: 25):")
+        bot.register_next_step_handler(msg, gestisci_importo_libero)
+
+
+def gestisci_importo_libero(message):
+    chat_id = message.chat.id
+    testo = message.text.strip().replace("€", "").replace(",", ".").strip()
+
+    try:
+        valore = float(testo)
+        if valore <= 0:
+            raise ValueError("importo non positivo")
+        importo = f"{valore:.2f}"
+    except ValueError:
+        bot.send_message(chat_id, "❌ Importo non valido. Riprova con /start.")
+        return
+
+    bot.send_message(chat_id, f"⏳ Sto generando il link per la donazione di {importo}€...")
+    url = ottieni_link_donazione(chat_id, importo)
+    if url:
+        keyboard = types.InlineKeyboardMarkup()
+        keyboard.add(types.InlineKeyboardButton(f"Dona {importo}€ →", url=url))
+        bot.send_message(chat_id, "✅ Clicca il pulsante per completare la donazione:", reply_markup=keyboard)
+    else:
+        bot.send_message(chat_id, "❌ Impossibile generare il link di donazione. Riprova più tardi.")
 
 
 # ---------- COMANDO POST (SOLO ADMIN) ----------
