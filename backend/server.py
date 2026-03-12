@@ -2,10 +2,14 @@ import os
 import time
 import uuid
 import logging
+import threading
 from typing import Optional
 
 import requests
 from flask import Flask, jsonify, request
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+from flask_cors import CORS
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -33,69 +37,87 @@ TRANSAK_CREATE_WIDGET_URL = os.getenv("TRANSAK_CREATE_WIDGET_URL", "")
 
 # Configuration
 BACKEND_REQUEST_TIMEOUT = int(os.getenv("BACKEND_REQUEST_TIMEOUT", "60"))
+RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "30"))
+TOKEN_CACHE_TTL_HOURS = int(os.getenv("TOKEN_CACHE_TTL_HOURS", "24"))
+CORS_ALLOWED_ORIGINS = os.getenv(
+    "CORS_ALLOWED_ORIGINS",
+    "https://frontemeridionale.github.io"
+)
+
+# CORS configuration
+CORS(app, resources={r"/*": {"origins": CORS_ALLOWED_ORIGINS.split(",")}})
+
+# Rate limiter (in-memory, suitable for single-process; use Redis for multi-worker)
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=[],
+)
 
 _partner_token_cache = {
     "token": None,
     "expires_at": 0,
 }
+_token_lock = threading.Lock()
 
 
 def get_partner_access_token(force_refresh: bool = False) -> str:
-    """Ottiene il token di accesso a Transak con caching."""
+    """Ottiene il token di accesso a Transak con caching thread-safe."""
     now = time.time()
 
-    if (
-        not force_refresh
-        and _partner_token_cache["token"]
-        and now < _partner_token_cache["expires_at"]
-    ):
-        logger.debug("Using cached Transak token")
-        return _partner_token_cache["token"]
+    with _token_lock:
+        if (
+            not force_refresh
+            and _partner_token_cache["token"]
+            and now < _partner_token_cache["expires_at"]
+        ):
+            logger.debug("Cache HIT: using cached Transak token")
+            return _partner_token_cache["token"]
 
-    logger.info("Requesting new Transak access token")
-    
-    headers = {
-        "accept": "application/json",
-        "content-type": "application/json",
-        "api-secret": TRANSAK_API_SECRET,
-    }
+        logger.info("Cache MISS: requesting new Transak access token")
 
-    payload = {
-        "apiKey": TRANSAK_API_KEY,
-    }
+        headers = {
+            "accept": "application/json",
+            "content-type": "application/json",
+            "api-secret": TRANSAK_API_SECRET,
+        }
 
-    try:
-        response = requests.post(
-            TRANSAK_REFRESH_TOKEN_URL,
-            headers=headers,
-            json=payload,
-            timeout=BACKEND_REQUEST_TIMEOUT,
+        payload = {
+            "apiKey": TRANSAK_API_KEY,
+        }
+
+        try:
+            response = requests.post(
+                TRANSAK_REFRESH_TOKEN_URL,
+                headers=headers,
+                json=payload,
+                timeout=BACKEND_REQUEST_TIMEOUT,
+            )
+            response.raise_for_status()
+        except requests.RequestException as e:
+            logger.error(f"Error refreshing Transak token: {e}")
+            raise
+
+        data = response.json()
+
+        access_token = (
+            data.get("accessToken")
+            or data.get("token")
+            or data.get("jwt")
+            or data.get("data", {}).get("accessToken")
         )
-        response.raise_for_status()
-    except requests.RequestException as e:
-        logger.error(f"Error refreshing Transak token: {e}")
-        raise
 
-    data = response.json()
+        if not access_token:
+            error_msg = f"Access token non trovato nella risposta: {data}"
+            logger.error(error_msg)
+            raise RuntimeError(error_msg)
 
-    access_token = (
-        data.get("accessToken")
-        or data.get("token")
-        or data.get("jwt")
-        or data.get("data", {}).get("accessToken")
-    )
+        _partner_token_cache["token"] = access_token
+        _partner_token_cache["expires_at"] = now + (TOKEN_CACHE_TTL_HOURS * 60 * 60)
 
-    if not access_token:
-        error_msg = f"Access token non trovato nella risposta: {data}"
-        logger.error(error_msg)
-        raise RuntimeError(error_msg)
+        logger.info(f"Transak token refreshed successfully (TTL={TOKEN_CACHE_TTL_HOURS}h)")
 
-    _partner_token_cache["token"] = access_token
-    _partner_token_cache["expires_at"] = now + (6 * 24 * 60 * 60)
-    
-    logger.info("Transak token refreshed successfully")
-
-    return access_token
+        return access_token
 
 
 def build_widget_payload(
@@ -209,8 +231,10 @@ def health():
 
 
 @app.route("/transak/widget-url", methods=["POST"])
+@limiter.limit(f"{RATE_LIMIT_PER_MINUTE} per minute")
 def transak_widget_url():
     """Endpoint per generare widget URL Transak."""
+    start_time = time.time()
     try:
         body = request.get_json(silent=True) or {}
 
@@ -231,6 +255,7 @@ def transak_widget_url():
             partner_order_id=partner_order_id,
         )
 
+        elapsed = time.time() - start_time
         response_data = {
             "success": True,
             "widgetUrl": widget_url,
@@ -238,18 +263,19 @@ def transak_widget_url():
             "network": "polygon",
             "cryptoCurrencyCode": "MATIC",
         }
-        
-        logger.info("Widget URL response: success=True")
+
+        logger.info(f"Widget URL response: success=True, elapsed={elapsed:.2f}s")
         return jsonify(response_data)
 
     except requests.HTTPError as e:
+        elapsed = time.time() - start_time
         details = ""
         try:
             details = e.response.text
         except Exception:
             details = str(e)
 
-        logger.error(f"HTTP error creating widget URL: {details}")
+        logger.error(f"HTTP error creating widget URL: {details}, elapsed={elapsed:.2f}s")
         
         return jsonify({
             "success": False,
@@ -258,7 +284,8 @@ def transak_widget_url():
         }), 502
 
     except requests.Timeout as e:
-        logger.error(f"Timeout creating widget URL: {e}")
+        elapsed = time.time() - start_time
+        logger.error(f"Timeout creating widget URL: {e}, elapsed={elapsed:.2f}s")
         return jsonify({
             "success": False,
             "error": "TIMEOUT_ERROR",
@@ -266,7 +293,8 @@ def transak_widget_url():
         }), 504
 
     except requests.RequestException as e:
-        logger.error(f"Request error creating widget URL: {e}")
+        elapsed = time.time() - start_time
+        logger.error(f"Request error creating widget URL: {e}, elapsed={elapsed:.2f}s")
         return jsonify({
             "success": False,
             "error": "REQUEST_ERROR",
@@ -274,12 +302,24 @@ def transak_widget_url():
         }), 502
 
     except Exception as e:
-        logger.exception(f"Unexpected error creating widget URL: {e}")
+        elapsed = time.time() - start_time
+        logger.exception(f"Unexpected error creating widget URL: {e}, elapsed={elapsed:.2f}s")
         return jsonify({
             "success": False,
             "error": "INTERNAL_ERROR",
             "details": str(e),
         }), 500
+
+
+@app.errorhandler(429)
+def ratelimit_handler(e):
+    """Risponde con messaggio amichevole quando il rate limit è superato."""
+    logger.warning(f"Rate limit exceeded from {get_remote_address()}: {e.description}")
+    return jsonify({
+        "success": False,
+        "error": "RATE_LIMIT_EXCEEDED",
+        "details": "Troppe richieste. Riprova tra qualche secondo.",
+    }), 429
 
 
 if __name__ == "__main__":
