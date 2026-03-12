@@ -1,7 +1,13 @@
 import os
+import logging
 import requests
 import telebot
 from telebot import types
+from tenacity import retry, stop_after_attempt, wait_exponential
+
+# Logging configuration
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+logger = logging.getLogger(__name__)
 
 TOKEN = os.getenv("BOT_TOKEN")
 BACKEND_BASE_URL = os.getenv("BACKEND_BASE_URL", "").rstrip("/")
@@ -11,6 +17,11 @@ if not TOKEN:
 
 if not BACKEND_BASE_URL:
     raise RuntimeError("BACKEND_BASE_URL non impostato")
+
+# Configuration
+BACKEND_REQUEST_TIMEOUT = int(os.getenv("BACKEND_REQUEST_TIMEOUT", "60"))
+BACKEND_MAX_RETRIES = int(os.getenv("BACKEND_MAX_RETRIES", "3"))
+BACKEND_RETRY_BACKOFF = int(os.getenv("BACKEND_RETRY_BACKOFF", "2"))
 
 bot = telebot.TeleBot(TOKEN)
 
@@ -51,23 +62,73 @@ def tastiera_donazione():
     return keyboard
 
 
-def crea_link_donazione(chat_id: int, amount: str):
+def verifica_backend_disponibile():
+    """Verifica se il backend è disponibile prima di fare richieste."""
     try:
-        response = requests.post(
-            f"{BACKEND_BASE_URL}/transak/widget-url",
-            json={
-                "fiatAmount": str(amount),
-                "fiatCurrency": "EUR",
-                "partnerCustomerId": str(chat_id),
-            },
-            timeout=30,
+        response = requests.get(
+            f"{BACKEND_BASE_URL}/health",
+            timeout=10,
         )
+        is_healthy = response.status_code == 200
+        if is_healthy:
+            logger.info("Backend health check: OK")
+        else:
+            logger.warning(f"Backend health check failed: status {response.status_code}")
+        return is_healthy
+    except requests.RequestException as e:
+        logger.warning(f"Backend health check failed: {e}")
+        return False
 
-        response.raise_for_status()
-        data = response.json()
+
+@retry(
+    stop=stop_after_attempt(BACKEND_MAX_RETRIES),
+    wait=wait_exponential(multiplier=BACKEND_RETRY_BACKOFF, min=1, max=10),
+    reraise=True,
+)
+def _richiesta_link_donazione(chat_id: int, amount: str) -> dict:
+    """Effettua la richiesta al backend con retry automatico."""
+    logger.info(f"Requesting donation link for chat_id={chat_id}, amount={amount}")
+    
+    response = requests.post(
+        f"{BACKEND_BASE_URL}/transak/widget-url",
+        json={
+            "fiatAmount": str(amount),
+            "fiatCurrency": "EUR",
+            "partnerCustomerId": str(chat_id),
+        },
+        timeout=BACKEND_REQUEST_TIMEOUT,
+    )
+
+    response.raise_for_status()
+    data = response.json()
+    
+    logger.info(f"Backend response: success={data.get('success')}")
+    return data
+
+
+def crea_link_donazione(chat_id: int, amount: str):
+    """Crea link di donazione con gestione robusta degli errori."""
+    try:
+        # Verifica che il backend sia disponibile
+        if not verifica_backend_disponibile():
+            bot.send_message(
+                chat_id,
+                "⚠️ Il servizio di donazione è temporaneamente non disponibile.\n\n"
+                "Per favore riprova tra pochi istanti."
+            )
+            logger.warning(f"Backend unavailable for chat_id={chat_id}")
+            return
+
+        # Richiesta con retry
+        data = _richiesta_link_donazione(chat_id, amount)
 
         if not data.get("success") or not data.get("widgetUrl"):
-            bot.send_message(chat_id, "Errore nella creazione del link di donazione.")
+            bot.send_message(
+                chat_id,
+                "⚠️ Errore nella creazione del link di donazione.\n\n"
+                "Per favore riprova."
+            )
+            logger.error(f"Backend returned error for chat_id={chat_id}: {data}")
             return
 
         widget_url = data["widgetUrl"]
@@ -79,14 +140,42 @@ def crea_link_donazione(chat_id: int, amount: str):
 
         bot.send_message(
             chat_id,
-            f"Procedi con la donazione di {amount}€ tramite il pulsante qui sotto:",
+            f"💳 Procedi con la donazione di {amount}€ tramite il pulsante qui sotto:",
             reply_markup=keyboard
         )
+        logger.info(f"Donation link sent to chat_id={chat_id}")
 
+    except requests.Timeout:
+        bot.send_message(
+            chat_id,
+            "⏱️ La richiesta ha impiegato troppo tempo.\n\n"
+            "Per favore riprova."
+        )
+        logger.error(f"Timeout while creating donation link for chat_id={chat_id}")
+    
+    except requests.ConnectionError as e:
+        bot.send_message(
+            chat_id,
+            "🔌 Errore di connessione.\n\n"
+            "Per favore riprova."
+        )
+        logger.error(f"Connection error for chat_id={chat_id}: {e}")
+    
     except requests.RequestException as e:
-        bot.send_message(chat_id, f"Errore di connessione al backend: {e}")
+        bot.send_message(
+            chat_id,
+            "⚠️ Errore nella richiesta al servizio.\n\n"
+            "Per favore riprova."
+        )
+        logger.error(f"Request exception for chat_id={chat_id}: {e}")
+    
     except Exception as e:
-        bot.send_message(chat_id, f"Errore interno: {e}")
+        bot.send_message(
+            chat_id,
+            "⚠️ Errore interno del servizio.\n\n"
+            "Per favore riprova."
+        )
+        logger.exception(f"Unexpected error for chat_id={chat_id}: {e}")
 
 
 @bot.message_handler(commands=["start"])
@@ -115,7 +204,7 @@ def risposta_pulsanti(call):
         pending_free_donation.add(chat_id)
         bot.send_message(
             chat_id,
-            "Inserisci l'importo che desideri donare in euro. Esempio: 25"
+            "💰 Inserisci l'importo che desideri donare in euro.\n\nEsempio: 25"
         )
 
     bot.answer_callback_query(call.id)
@@ -130,14 +219,17 @@ def gestisci_donazione_libera(message):
         amount = float(testo)
 
         if amount <= 0:
-            bot.send_message(chat_id, "Inserisci un importo maggiore di zero.")
+            bot.send_message(chat_id, "❌ Inserisci un importo maggiore di zero.")
             return
 
         pending_free_donation.discard(chat_id)
         crea_link_donazione(chat_id, str(amount))
 
     except ValueError:
-        bot.send_message(chat_id, "Importo non valido. Inserisci solo un numero, ad esempio: 25")
+        bot.send_message(
+            chat_id,
+            "❌ Importo non valido.\n\nInserisci solo un numero, ad esempio: 25"
+        )
 
 
 @bot.message_handler(commands=["post"])
@@ -163,6 +255,7 @@ def id_utente(message):
     bot.reply_to(message, f"Il tuo user ID è: {message.from_user.id}")
 
 
-print("Bot in esecuzione...")
-bot.remove_webhook()
-bot.infinity_polling(skip_pending=True)
+if __name__ == "__main__":
+    logger.info("Bot in esecuzione...")
+    bot.remove_webhook()
+    bot.infinity_polling(skip_pending=True)
