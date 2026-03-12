@@ -1,10 +1,37 @@
+import logging
 import os
+import threading
+import time
+
 import requests
 import telebot
 from telebot import types
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+    before_sleep_log,
+)
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 TOKEN = os.getenv("BOT_TOKEN")
 BACKEND_BASE_URL = os.getenv("BACKEND_BASE_URL", "").rstrip("/")
+
+try:
+    BACKEND_REQUEST_TIMEOUT = int(os.getenv("BACKEND_REQUEST_TIMEOUT", "60"))
+except ValueError:
+    raise RuntimeError("BACKEND_REQUEST_TIMEOUT deve essere un numero intero")
+
+try:
+    MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
+except ValueError:
+    raise RuntimeError("MAX_RETRIES deve essere un numero intero")
 
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN non impostato")
@@ -18,6 +45,67 @@ CHANNEL_ID = "@FRONTE_MERIDIONALE"
 AUTHORIZED_USERS = {1685607625}
 
 pending_free_donation = set()
+
+# Circuit breaker state
+_circuit_lock = threading.Lock()
+_circuit = {
+    "failures": 0,
+    "open_until": 0,
+}
+_CIRCUIT_FAILURE_THRESHOLD = 5
+_CIRCUIT_OPEN_SECONDS = 60
+
+
+def _is_circuit_open() -> bool:
+    with _circuit_lock:
+        if _circuit["failures"] >= _CIRCUIT_FAILURE_THRESHOLD:
+            if time.time() < _circuit["open_until"]:
+                return True
+            _circuit["failures"] = 0
+    return False
+
+
+def _record_failure():
+    with _circuit_lock:
+        _circuit["failures"] += 1
+        _circuit["open_until"] = time.time() + _CIRCUIT_OPEN_SECONDS
+
+
+def _record_success():
+    with _circuit_lock:
+        _circuit["failures"] = 0
+
+
+def check_backend_health() -> bool:
+    try:
+        response = requests.get(
+            f"{BACKEND_BASE_URL}/health",
+            timeout=10,
+        )
+        return response.status_code == 200
+    except requests.RequestException:
+        return False
+
+
+@retry(
+    retry=retry_if_exception_type(requests.Timeout),
+    stop=stop_after_attempt(MAX_RETRIES),
+    wait=wait_exponential(multiplier=1, min=2, max=30),
+    before_sleep=before_sleep_log(logger, logging.WARNING),
+    reraise=True,
+)
+def _post_widget_url(chat_id: int, amount: str) -> dict:
+    response = requests.post(
+        f"{BACKEND_BASE_URL}/transak/widget-url",
+        json={
+            "fiatAmount": str(amount),
+            "fiatCurrency": "EUR",
+            "partnerCustomerId": str(chat_id),
+        },
+        timeout=BACKEND_REQUEST_TIMEOUT,
+    )
+    response.raise_for_status()
+    return response.json()
 
 
 def testo_centrale():
@@ -52,24 +140,30 @@ def tastiera_donazione():
 
 
 def crea_link_donazione(chat_id: int, amount: str):
-    try:
-        response = requests.post(
-            f"{BACKEND_BASE_URL}/transak/widget-url",
-            json={
-                "fiatAmount": str(amount),
-                "fiatCurrency": "EUR",
-                "partnerCustomerId": str(chat_id),
-            },
-            timeout=30,
-        )
+    if _is_circuit_open():
+        logger.warning("Circuit breaker aperto, richiesta bloccata per chat_id=%s", chat_id)
+        try:
+            bot.send_message(
+                chat_id,
+                "Il servizio è temporaneamente non disponibile. Riprova tra qualche minuto."
+            )
+        except Exception:
+            logger.exception("Impossibile inviare messaggio circuit breaker a chat_id=%s", chat_id)
+        return
 
-        response.raise_for_status()
-        data = response.json()
+    try:
+        logger.info("Richiesta widget URL per chat_id=%s amount=%s", chat_id, amount)
+        data = _post_widget_url(chat_id, amount)
 
         if not data.get("success") or not data.get("widgetUrl"):
-            bot.send_message(chat_id, "Errore nella creazione del link di donazione.")
+            logger.error(
+                "Risposta backend non valida per chat_id=%s: success=%s, widgetUrl presente=%s",
+                chat_id, data.get("success"), bool(data.get("widgetUrl"))
+            )
+            bot.send_message(chat_id, "Errore nella creazione del link di donazione. Riprova più tardi.")
             return
 
+        _record_success()
         widget_url = data["widgetUrl"]
 
         keyboard = types.InlineKeyboardMarkup()
@@ -83,10 +177,34 @@ def crea_link_donazione(chat_id: int, amount: str):
             reply_markup=keyboard
         )
 
+    except requests.Timeout:
+        _record_failure()
+        logger.error(
+            "Timeout connessione al backend per chat_id=%s (dopo %d tentativi)",
+            chat_id, MAX_RETRIES
+        )
+        bot.send_message(
+            chat_id,
+            "Il servizio è lento a rispondere. Riprova tra qualche istante."
+        )
+    except requests.ConnectionError:
+        _record_failure()
+        logger.error("Errore di connessione al backend per chat_id=%s", chat_id)
+        bot.send_message(
+            chat_id,
+            "Impossibile raggiungere il servizio. Verifica la connessione e riprova."
+        )
+    except requests.HTTPError as e:
+        _record_failure()
+        logger.error("Errore HTTP dal backend per chat_id=%s: %s", chat_id, e)
+        bot.send_message(chat_id, "Errore dal servizio. Riprova più tardi.")
     except requests.RequestException as e:
-        bot.send_message(chat_id, f"Errore di connessione al backend: {e}")
+        _record_failure()
+        logger.error("Errore di rete per chat_id=%s: %s", chat_id, e)
+        bot.send_message(chat_id, "Errore di connessione. Riprova più tardi.")
     except Exception as e:
-        bot.send_message(chat_id, f"Errore interno: {e}")
+        logger.exception("Errore imprevisto per chat_id=%s", chat_id)
+        bot.send_message(chat_id, "Si è verificato un errore imprevisto. Riprova più tardi.")
 
 
 @bot.message_handler(commands=["start"])
@@ -163,6 +281,9 @@ def id_utente(message):
     bot.reply_to(message, f"Il tuo user ID è: {message.from_user.id}")
 
 
-print("Bot in esecuzione...")
+logger.info(
+    "Bot in esecuzione (timeout=%ds, max_retries=%d)...",
+    BACKEND_REQUEST_TIMEOUT, MAX_RETRIES
+)
 bot.remove_webhook()
 bot.infinity_polling(skip_pending=True)

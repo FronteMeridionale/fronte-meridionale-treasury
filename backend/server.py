@@ -1,4 +1,6 @@
+import logging
 import os
+import threading
 import time
 import uuid
 from typing import Optional
@@ -8,6 +10,12 @@ from flask import Flask, jsonify, request
 from dotenv import load_dotenv
 
 load_dotenv()
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
@@ -25,7 +33,14 @@ REFERRER_DOMAIN = os.getenv(
 
 TRANSAK_REFRESH_TOKEN_URL = os.getenv("TRANSAK_REFRESH_TOKEN_URL", "")
 TRANSAK_CREATE_WIDGET_URL = os.getenv("TRANSAK_CREATE_WIDGET_URL", "")
+try:
+    TRANSAK_REQUEST_TIMEOUT = int(os.getenv("TRANSAK_REQUEST_TIMEOUT", "30"))
+except ValueError:
+    raise RuntimeError("TRANSAK_REQUEST_TIMEOUT deve essere un numero intero")
 
+_TOKEN_CACHE_TTL = 24 * 60 * 60  # 24 hours
+
+_token_cache_lock = threading.Lock()
 _partner_token_cache = {
     "token": None,
     "expires_at": 0,
@@ -35,12 +50,15 @@ _partner_token_cache = {
 def get_partner_access_token(force_refresh: bool = False) -> str:
     now = time.time()
 
-    if (
-        not force_refresh
-        and _partner_token_cache["token"]
-        and now < _partner_token_cache["expires_at"]
-    ):
-        return _partner_token_cache["token"]
+    with _token_cache_lock:
+        if (
+            not force_refresh
+            and _partner_token_cache["token"]
+            and now < _partner_token_cache["expires_at"]
+        ):
+            return _partner_token_cache["token"]
+
+    logger.info("Recupero partner access token (force_refresh=%s)", force_refresh)
 
     headers = {
         "accept": "application/json",
@@ -56,7 +74,7 @@ def get_partner_access_token(force_refresh: bool = False) -> str:
         TRANSAK_REFRESH_TOKEN_URL,
         headers=headers,
         json=payload,
-        timeout=30,
+        timeout=TRANSAK_REQUEST_TIMEOUT,
     )
 
     response.raise_for_status()
@@ -73,8 +91,10 @@ def get_partner_access_token(force_refresh: bool = False) -> str:
     if not access_token:
         raise RuntimeError(f"Access token non trovato nella risposta: {data}")
 
-    _partner_token_cache["token"] = access_token
-    _partner_token_cache["expires_at"] = now + (6 * 24 * 60 * 60)
+    with _token_cache_lock:
+        _partner_token_cache["token"] = access_token
+        _partner_token_cache["expires_at"] = now + _TOKEN_CACHE_TTL
+    logger.info("Partner access token aggiornato, scade in %dh", _TOKEN_CACHE_TTL // 3600)
 
     return access_token
 
@@ -132,14 +152,20 @@ def create_widget_url(
         partner_order_id=partner_order_id,
     )
 
+    logger.info(
+        "Creazione widget URL per customer_id=%s amount=%s %s",
+        partner_customer_id, fiat_amount, fiat_currency
+    )
+
     response = requests.post(
         TRANSAK_CREATE_WIDGET_URL,
         headers=headers,
         json=payload,
-        timeout=30,
+        timeout=TRANSAK_REQUEST_TIMEOUT,
     )
 
     if response.status_code == 401:
+        logger.warning("Token scaduto (401), forzo il refresh e riprovo")
         token = get_partner_access_token(force_refresh=True)
         headers["access-token"] = token
 
@@ -147,7 +173,7 @@ def create_widget_url(
             TRANSAK_CREATE_WIDGET_URL,
             headers=headers,
             json=payload,
-            timeout=30,
+            timeout=TRANSAK_REQUEST_TIMEOUT,
         )
 
     response.raise_for_status()
@@ -162,6 +188,7 @@ def create_widget_url(
     if not widget_url:
         raise RuntimeError(f"widgetUrl non trovata nella risposta: {data}")
 
+    logger.info("Widget URL creato con successo per customer_id=%s", partner_customer_id)
     return widget_url
 
 
@@ -202,6 +229,7 @@ def transak_widget_url():
         except Exception:
             details = str(e)
 
+        logger.error("Errore HTTP da Transak: %s | dettagli: %s", e, details)
         return jsonify({
             "success": False,
             "error": "HTTP_ERROR",
@@ -209,6 +237,7 @@ def transak_widget_url():
         }), 502
 
     except Exception as e:
+        logger.exception("Errore interno nella creazione del widget URL")
         return jsonify({
             "success": False,
             "error": "INTERNAL_ERROR",
