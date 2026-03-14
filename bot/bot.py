@@ -2,7 +2,7 @@ import os
 import logging
 import time
 import threading
-from typing import Dict, Set
+from typing import Dict
 import requests
 import telebot
 from telebot import types
@@ -22,7 +22,7 @@ if not BACKEND_BASE_URL:
     raise RuntimeError("BACKEND_BASE_URL non impostato")
 
 # Configuration
-BACKEND_REQUEST_TIMEOUT = int(os.getenv("BACKEND_REQUEST_TIMEOUT", "60"))
+BACKEND_REQUEST_TIMEOUT = int(os.getenv("BACKEND_REQUEST_TIMEOUT", "30"))
 DEBOUNCE_WINDOW_SECONDS = int(os.getenv("DEBOUNCE_WINDOW_SECONDS", "5"))
 
 bot = telebot.TeleBot(TOKEN)
@@ -30,8 +30,23 @@ bot = telebot.TeleBot(TOKEN)
 CHANNEL_ID = "@FRONTE_MERIDIONALE"
 AUTHORIZED_USERS = {1685607625}
 
-pending_free_donation: Set[int] = set()
-_pending_donation_lock = threading.Lock()
+# Quote disponibili (20/40/60/80)
+DONATION_AMOUNTS = {
+    "20": "Dona 20€",
+    "40": "Dona 40€",
+    "60": "Dona 60€",
+    "80": "Dona 80€",
+}
+
+# Metodi di pagamento
+PAYMENT_METHODS = {
+    "card": "💳 Carta",
+    "bank": "🏦 Bonifico",
+}
+
+# Stato: traccia quale utente sta scegliendo metodo e importo
+pending_payment_method: Dict[int, str] = {}
+
 _debounce_lock = threading.Lock()
 _debounce_tracker: Dict[str, float] = {}
 
@@ -39,20 +54,20 @@ _debounce_tracker: Dict[str, float] = {}
 # ============================================================================
 # UTILITY: Debounce Protection
 # ============================================================================
-def _make_debounce_key(chat_id: int, amount: str) -> str:
-    """Genera debounce key da chat_id e amount."""
-    return f"{chat_id}:{amount}"
+def _make_debounce_key(chat_id: int, amount: str, method: str) -> str:
+    """Genera debounce key da chat_id, amount e method."""
+    return f"{chat_id}:{amount}:{method}"
 
 
-def _is_debounced(chat_id: int, amount: str) -> bool:
+def _is_debounced(chat_id: int, amount: str, method: str) -> bool:
     """
-    Verifica se una richiesta (chat_id, amount) è in debounce.
+    Verifica se una richiesta (chat_id, amount, method) è in debounce.
 
     Returns:
         True se in debounce, False altrimenti
     """
     now = time.time()
-    debounce_key = _make_debounce_key(chat_id, amount)
+    debounce_key = _make_debounce_key(chat_id, amount, method)
 
     with _debounce_lock:
         if debounce_key in _debounce_tracker:
@@ -72,57 +87,53 @@ def _is_debounced(chat_id: int, amount: str) -> bool:
 
 
 def _format_amount(amount: str) -> str:
-    """Formatta importo per visualizzazione (senza zeri superflui)."""
+    """Formatta importo per visualizzazione."""
     try:
         amount_float = float(amount)
         if amount_float == int(amount_float):
             return f"{int(amount_float)}"
-        else:
-            formatted = f"{amount_float:.10f}".rstrip('0')
-            return formatted
+        formatted = f"{amount_float:.10f}".rstrip("0").rstrip(".")
+        return formatted
     except (ValueError, TypeError):
         return amount
 
 
 def _get_error_message(error_code: str, retry_after: int = 0) -> str:
-    """
-    Genera messaggio utente in base al codice di errore backend.
-    """
+    """Genera messaggio utente in base al codice di errore backend."""
     if error_code == "RATE_LIMITED":
         return (
             f"⏱️ Troppe richieste. Attendi {retry_after}s e riprova.\n\n"
             f"Il nostro backend ha un limite di richieste per proteggere il servizio."
         )
-    elif error_code == "UPSTREAM_RATE_LIMITED":
+    if error_code == "UPSTREAM_RATE_LIMITED":
         return (
             f"⏱️ Il servizio Transak è momentaneamente sovraccarico. "
             f"Attendi {retry_after}s e riprova."
         )
-    elif error_code == "UPSTREAM_TIMEOUT":
+    if error_code == "UPSTREAM_TIMEOUT":
         return (
             "⏱️ La richiesta ha impiegato troppo tempo.\n\n"
             "Per favore riprova."
         )
-    elif error_code == "UPSTREAM_CONNECTION_ERROR":
+    if error_code == "UPSTREAM_CONNECTION_ERROR":
         return (
             "🔌 Errore di connessione con il servizio di pagamento.\n\n"
             "Per favore riprova."
         )
-    elif error_code == "UPSTREAM_AUTH_ERROR":
+    if error_code == "UPSTREAM_AUTH_ERROR":
         return (
             "❌ Errore di autenticazione con il servizio.\n\n"
             "Per favore contatta l'amministratore."
         )
-    elif error_code == "INVALID_REQUEST":
+    if error_code == "INVALID_REQUEST":
         return (
             "❌ Richiesta non valida.\n\n"
             "Per favore verifica i dati inseriti e riprova."
         )
-    else:
-        return (
-            "❌ Errore nel servizio di donazione.\n\n"
-            "Per favore riprova più tardi."
-        )
+    return (
+        "❌ Errore nel servizio di donazione.\n\n"
+        "Per favore riprova più tardi."
+    )
 
 
 # ============================================================================
@@ -147,13 +158,26 @@ def testo_centrale():
     )
 
 
-def tastiera_donazione():
+def tastiera_importi():
+    """Tastiera con quote fisse (20/40/60/80) - Step 1."""
     keyboard = types.InlineKeyboardMarkup(row_width=2)
-    btn1 = types.InlineKeyboardButton("Dona 20€", callback_data="donazione_20")
-    btn2 = types.InlineKeyboardButton("Dona 30€", callback_data="donazione_30")
-    btn3 = types.InlineKeyboardButton("Dona 50€", callback_data="donazione_50")
-    btn4 = types.InlineKeyboardButton("Donazione libera", callback_data="donazione_libera")
-    keyboard.add(btn1, btn2, btn3, btn4)
+    buttons = [
+        types.InlineKeyboardButton("Dona 20€", callback_data="amount_20"),
+        types.InlineKeyboardButton("Dona 40€", callback_data="amount_40"),
+        types.InlineKeyboardButton("Dona 60€", callback_data="amount_60"),
+        types.InlineKeyboardButton("Dona 80€", callback_data="amount_80"),
+    ]
+    keyboard.add(*buttons)
+    return keyboard
+
+
+def tastiera_metodo_pagamento(amount: str):
+    """Tastiera per scelta metodo pagamento (Carta / Bonifico) - Step 2."""
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    keyboard.add(
+        types.InlineKeyboardButton("💳 Carta", callback_data=f"method_card_{amount}"),
+        types.InlineKeyboardButton("🏦 Bonifico", callback_data=f"method_bank_{amount}"),
+    )
     return keyboard
 
 
@@ -163,10 +187,7 @@ def tastiera_donazione():
 def verifica_backend_disponibile() -> bool:
     """Verifica se il backend è disponibile prima di fare richieste."""
     try:
-        response = requests.get(
-            f"{BACKEND_BASE_URL}/health",
-            timeout=10,
-        )
+        response = requests.get(f"{BACKEND_BASE_URL}/health", timeout=10)
         is_healthy = response.status_code == 200
         if is_healthy:
             logger.info("BACKEND_HEALTH: OK")
@@ -181,26 +202,22 @@ def verifica_backend_disponibile() -> bool:
 # ============================================================================
 # BACKEND REQUEST
 # ============================================================================
-def _richiesta_link_donazione(chat_id: int, amount: str) -> dict:
+def _richiesta_link_donazione_metodo(chat_id: int, amount: str, method: str) -> dict:
     """
-    Effettua la richiesta al backend per ottenere widget URL.
-
-    Non usa raise_for_status() per permettere lettura di errori JSON.
-
-    Returns:
-        Risposta JSON del backend (success=true o success=false)
-
-    Raises:
-        requests.Timeout: se timeout
-        requests.ConnectionError: se connessione fallisce
-        requests.RequestException: su altri errori di connessione
-        RuntimeError: se risposta non è JSON valido
+    Effettua la richiesta al backend per carta o bonifico.
     """
-    logger.info(f"REQUEST_BACKEND: chat_id={chat_id}, amount={_format_amount(amount)}")
+    logger.info(f"REQUEST_BACKEND: chat_id={chat_id}, amount={amount}, method={method}")
+
+    if method == "card":
+        endpoint = f"{BACKEND_BASE_URL}/transak/widget-url"
+    elif method == "bank":
+        endpoint = f"{BACKEND_BASE_URL}/transak/bank-order"
+    else:
+        raise ValueError(f"Unknown payment method: {method}")
 
     try:
         response = requests.post(
-            f"{BACKEND_BASE_URL}/transak/widget-url",
+            endpoint,
             json={
                 "fiatAmount": str(amount),
                 "fiatCurrency": "EUR",
@@ -218,6 +235,12 @@ def _richiesta_link_donazione(chat_id: int, amount: str) -> dict:
         logger.error(f"REQUEST_BACKEND: REQUEST_ERROR for chat_id={chat_id}: {e}")
         raise
 
+    if response.status_code != 200:
+        logger.error(
+            f"REQUEST_BACKEND_HTTP_ERROR: chat_id={chat_id}, "
+            f"status={response.status_code}"
+        )
+
     try:
         data = response.json()
     except Exception as e:
@@ -231,21 +254,19 @@ def _richiesta_link_donazione(chat_id: int, amount: str) -> dict:
 # ============================================================================
 # DONATION LINK CREATION
 # ============================================================================
-def crea_link_donazione(chat_id: int, amount: str):
+def crea_link_donazione(chat_id: int, amount: str, method: str):
     """
-    Crea link di donazione con gestione robusta degli errori.
-
-    Applica debounce, health check, e messaggi discriminati per ogni errore.
+    Crea link di donazione (carta via widget) o ordine bancario (bonifico via redirectUrl).
     """
-    if _is_debounced(chat_id, amount):
-        logger.debug(f"DEBOUNCE_BLOCKED: chat_id={chat_id}, amount={_format_amount(amount)}")
+    if _is_debounced(chat_id, amount, method):
+        logger.debug(f"DEBOUNCE_BLOCKED: chat_id={chat_id}, amount={amount}, method={method}")
         bot.send_message(
             chat_id,
             "⏳ Richiesta già in corso. Attendi qualche secondo..."
         )
         return
 
-    logger.info(f"DONATION_FLOW_START: chat_id={chat_id}, amount={_format_amount(amount)}")
+    logger.info(f"DONATION_FLOW_START: chat_id={chat_id}, amount={amount}, method={method}")
 
     if not verifica_backend_disponibile():
         logger.warning(f"DONATION_FLOW: backend unavailable for chat_id={chat_id}")
@@ -257,44 +278,74 @@ def crea_link_donazione(chat_id: int, amount: str):
         return
 
     try:
-        data = _richiesta_link_donazione(chat_id, amount)
+        data = _richiesta_link_donazione_metodo(chat_id, amount, method)
 
         if not data.get("success"):
             error_code = data.get("error", "UNKNOWN_ERROR")
-            retry_after = data.get("retry_after", 0)
+            details = data.get("details", "")
 
             logger.error(
                 f"DONATION_FLOW: backend error for chat_id={chat_id}, "
-                f"error_code={error_code}, retry_after={retry_after}"
+                f"error_code={error_code}, details={details}"
             )
 
-            error_message = _get_error_message(error_code, retry_after)
+            error_message = _get_error_message(error_code, data.get("retry_after", 0))
             bot.send_message(chat_id, error_message)
             return
 
-        widget_url = data.get("widgetUrl")
-        if not widget_url:
-            logger.error(f"DONATION_FLOW: no widgetUrl in response for chat_id={chat_id}")
+        if method == "card":
+            widget_url = data.get("widgetUrl")
+            if not widget_url:
+                logger.error(f"DONATION_FLOW: no widgetUrl in response for chat_id={chat_id}")
+                bot.send_message(
+                    chat_id,
+                    "❌ Errore nella creazione del link di donazione.\n\n"
+                    "Per favore riprova."
+                )
+                return
+
+            keyboard = types.InlineKeyboardMarkup()
+            keyboard.add(types.InlineKeyboardButton("Apri Transak", url=widget_url))
+
+            amount_formatted = _format_amount(amount)
             bot.send_message(
                 chat_id,
-                "❌ Errore nella creazione del link di donazione.\n\n"
-                "Per favore riprova."
+                f"💳 Procedi con la donazione di {amount_formatted}€ tramite il pulsante qui sotto:",
+                reply_markup=keyboard
             )
-            return
+            logger.info(f"DONATION_FLOW_SUCCESS: card link sent to chat_id={chat_id}")
 
-        keyboard = types.InlineKeyboardMarkup()
-        keyboard.add(
-            types.InlineKeyboardButton("Apri Transak", url=widget_url)
-        )
+        elif method == "bank":
+            redirect_url = data.get("redirectUrl")
+            order_id = data.get("orderId")
 
-        amount_formatted = _format_amount(amount)
-        bot.send_message(
-            chat_id,
-            f"💳 Procedi con la donazione di {amount_formatted}€ tramite il pulsante qui sotto:",
-            reply_markup=keyboard
-        )
+            if not redirect_url or not order_id:
+                logger.error(
+                    f"DONATION_FLOW: no redirectUrl or orderId in response for chat_id={chat_id}"
+                )
+                bot.send_message(
+                    chat_id,
+                    "❌ Errore nella creazione dell'ordine bancario.\n\n"
+                    "Per favore riprova."
+                )
+                return
 
-        logger.info(f"DONATION_FLOW_SUCCESS: link sent to chat_id={chat_id}, amount={amount_formatted}€")
+            keyboard = types.InlineKeyboardMarkup()
+            keyboard.add(
+                types.InlineKeyboardButton("Completa Pagamento", url=redirect_url)
+            )
+
+            amount_formatted = _format_amount(amount)
+            bot.send_message(
+                chat_id,
+                f"🏦 Ordine di bonifico creato per {amount_formatted}€\n\n"
+                f"<b>ID Ordine:</b> <code>{order_id}</code>\n\n"
+                f"Clicca il pulsante qui sotto per completare il pagamento tramite il tuo conto bancario.\n\n"
+                f"<i>Verrai reindirizzato alla tua banca per autenticarti e confermare il trasferimento.</i>",
+                parse_mode="HTML",
+                reply_markup=keyboard
+            )
+            logger.info(f"DONATION_FLOW_SUCCESS: bank order with redirectUrl sent to chat_id={chat_id}")
 
     except requests.Timeout:
         logger.error(f"DONATION_FLOW: TIMEOUT for chat_id={chat_id}")
@@ -345,16 +396,20 @@ def start(message):
     """Gestore comando /start."""
     chat_id = message.chat.id
     logger.info(f"HANDLER_START: chat_id={chat_id}")
+
+    if chat_id in pending_payment_method:
+        del pending_payment_method[chat_id]
+
     bot.send_message(
         chat_id,
         testo_centrale(),
-        reply_markup=tastiera_donazione()
+        reply_markup=tastiera_importi()
     )
 
 
 @bot.callback_query_handler(func=lambda call: True)
 def risposta_pulsanti(call):
-    """Gestore callback pulsanti donazione."""
+    """Gestore callback pulsanti donazione (Step 1: Importo, Step 2: Metodo)."""
     chat_id = call.message.chat.id
     callback_data = call.data
 
@@ -362,49 +417,32 @@ def risposta_pulsanti(call):
 
     logger.info(f"HANDLER_CALLBACK: chat_id={chat_id}, callback_data={callback_data}")
 
-    if callback_data == "donazione_20":
-        crea_link_donazione(chat_id, "20")
-    elif callback_data == "donazione_30":
-        crea_link_donazione(chat_id, "30")
-    elif callback_data == "donazione_50":
-        crea_link_donazione(chat_id, "50")
-    elif callback_data == "donazione_libera":
-        with _pending_donation_lock:
-            pending_free_donation.add(chat_id)
-        logger.debug(f"HANDLER_CALLBACK: waiting for free donation amount from chat_id={chat_id}")
-        bot.send_message(
-            chat_id,
-            "💰 Inserisci l'importo che desideri donare in euro.\n\nEsempio: 25"
-        )
+    if callback_data.startswith("amount_"):
+        amount = callback_data.replace("amount_", "")
+        if amount in DONATION_AMOUNTS:
+            logger.debug(f"HANDLER_CALLBACK: amount selected, amount={amount}, chat_id={chat_id}")
+            pending_payment_method[chat_id] = amount
+            bot.send_message(
+                chat_id,
+                "Scegli il metodo di pagamento:",
+                reply_markup=tastiera_metodo_pagamento(amount)
+            )
+        return
 
+    if callback_data.startswith("method_"):
+        parts = callback_data.split("_")
+        if len(parts) >= 3:
+            method = parts[1]
+            amount = "_".join(parts[2:])
 
-@bot.message_handler(func=lambda message: message.chat.id in pending_free_donation)
-def gestisci_donazione_libera(message):
-    """Gestore input utente per donazione libera."""
-    chat_id = message.chat.id
-    testo = message.text.strip().replace(",", ".")
-
-    logger.info(f"HANDLER_FREE_DONATION: chat_id={chat_id}, input={testo}")
-
-    try:
-        amount = float(testo)
-
-        if amount <= 0:
-            logger.debug(f"HANDLER_FREE_DONATION: invalid amount (<=0) from chat_id={chat_id}")
-            bot.send_message(chat_id, "❌ Inserisci un importo maggiore di zero.")
-            return
-
-        with _pending_donation_lock:
-            pending_free_donation.discard(chat_id)
-
-        crea_link_donazione(chat_id, str(amount))
-
-    except ValueError:
-        logger.debug(f"HANDLER_FREE_DONATION: invalid format from chat_id={chat_id}")
-        bot.send_message(
-            chat_id,
-            "❌ Importo non valido.\n\nInserisci solo un numero, ad esempio: 25"
-        )
+            if chat_id in pending_payment_method and pending_payment_method[chat_id] == amount:
+                if method in PAYMENT_METHODS:
+                    logger.debug(
+                        f"HANDLER_CALLBACK: method selected, method={method}, amount={amount}, chat_id={chat_id}"
+                    )
+                    del pending_payment_method[chat_id]
+                    crea_link_donazione(chat_id, amount, method)
+        return
 
 
 @bot.message_handler(commands=["post"])
