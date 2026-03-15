@@ -4,6 +4,7 @@ import uuid
 import logging
 import threading
 from typing import Optional, Dict, Tuple
+from urllib.parse import urlparse
 
 import requests
 from flask import Flask, jsonify, request
@@ -35,6 +36,64 @@ REFERRER_DOMAIN = os.getenv(
 
 TRANSAK_REFRESH_TOKEN_URL = os.getenv("TRANSAK_REFRESH_TOKEN_URL", "")
 TRANSAK_CREATE_WIDGET_URL = os.getenv("TRANSAK_CREATE_WIDGET_URL", "")
+
+# ============================================================================
+# STARTUP VALIDATION
+# ============================================================================
+_REQUIRED_ENV_VARS = [
+    "TRANSAK_API_KEY",
+    "TRANSAK_API_SECRET",
+    "TRANSAK_REFRESH_TOKEN_URL",
+    "TRANSAK_CREATE_WIDGET_URL",
+]
+
+def _validate_startup_env():
+    """
+    Verifica che tutte le variabili d'ambiente obbligatorie siano impostate e non vuote.
+    In caso contrario solleva RuntimeError con un messaggio esplicito.
+    NON logga mai segreti.
+    """
+    missing = [v for v in _REQUIRED_ENV_VARS if not (os.getenv(v) or "").strip()]
+    if missing:
+        raise RuntimeError(
+            f"STARTUP_ERROR: variabili d'ambiente obbligatorie mancanti o vuote: "
+            f"{', '.join(missing)}. "
+            "Controlla il file .env o le variabili d'ambiente del server."
+        )
+
+
+def _log_startup_info():
+    """
+    Logga informazioni di configurazione all'avvio.
+    NON logga mai segreti (API key, API secret).
+    """
+    token_url = TRANSAK_REFRESH_TOKEN_URL
+    widget_url = TRANSAK_CREATE_WIDGET_URL
+
+    token_url_lower = token_url.lower()
+    token_hostname = urlparse(token_url).hostname or ""
+    if "staging" in token_url_lower:
+        env_label = "STAGING"
+    elif token_hostname == "transak.com" or token_hostname.endswith(".transak.com"):
+        env_label = "PRODUCTION"
+    else:
+        env_label = "UNKNOWN"
+
+    logger.info(f"STARTUP: TRANSAK_REFRESH_TOKEN_URL = {token_url}")
+    logger.info(f"STARTUP: TRANSAK_CREATE_WIDGET_URL = {widget_url}")
+    logger.info(f"STARTUP: Transak environment deduced = {env_label}")
+    logger.info(f"STARTUP: TREASURY_WALLET = {TREASURY_WALLET}")
+    logger.info(f"STARTUP: REFERRER_DOMAIN = {REFERRER_DOMAIN}")
+    if env_label == "PRODUCTION":
+        logger.warning(
+            "STARTUP: ambiente PRODUCTION attivo — "
+            "assicurarsi che TRANSAK_API_KEY e TRANSAK_API_SECRET siano credenziali production."
+        )
+    elif env_label == "STAGING":
+        logger.info(
+            "STARTUP: ambiente STAGING attivo — "
+            "NON usare chiavi production con endpoint staging."
+        )
 
 # Resilience configuration
 BACKEND_REQUEST_TIMEOUT = int(os.getenv("BACKEND_REQUEST_TIMEOUT", "60"))
@@ -654,7 +713,52 @@ def transak_widget_url():
         }), 500
 
 
+@app.route("/transak/bank-order", methods=["POST"])
+def transak_bank_order():
+    """
+    Stub endpoint per il flusso bonifico Transak.
+
+    GAP TECNICO: Transak non espone un'API documentata pubblica per creare
+    ordini bancari (bank transfer) lato server con redirect URL e order ID
+    nel medesimo pattern del widget URL. Questo endpoint è uno stub esplicito
+    che restituisce un errore chiaro finché l'integrazione non sarà documentata
+    e implementata completamente.
+
+    Il bot si aspetta una risposta con:
+        - redirectUrl: URL verso cui redirigere l'utente per il bonifico
+        - orderId: identificativo univoco dell'ordine
+
+    Finché questo endpoint non è implementato, il flusso Bonifico non è
+    operativo. Il flusso Carta (via /transak/widget-url) è invece funzionante.
+
+    Response (stub error):
+        {
+            "success": false,
+            "error": "NOT_IMPLEMENTED",
+            "details": "..."
+        }
+    """
+    body = request.get_json(silent=True) or {}
+    logger.warning(
+        f"BANK_ORDER_STUB: endpoint non implementato — "
+        f"fiatAmount={body.get('fiatAmount')}, "
+        f"fiatCurrency={body.get('fiatCurrency')}, "
+        f"partnerCustomerId={body.get('partnerCustomerId')}"
+    )
+    return jsonify({
+        "success": False,
+        "error": "NOT_IMPLEMENTED",
+        "details": (
+            "Il flusso bonifico non è ancora implementato. "
+            "L'integrazione bancaria Transak richiede documentazione aggiuntiva "
+            "non ancora disponibile. Usa il flusso Carta nel frattempo."
+        ),
+    }), 501
+
+
 if __name__ == "__main__":
+    _validate_startup_env()
+    _log_startup_info()
     port = int(os.getenv("PORT", "5000"))
     logger.info(f"STARTUP: starting backend server on port {port}")
     app.run(

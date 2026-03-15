@@ -130,6 +130,27 @@ def _get_error_message(error_code: str, retry_after: int = 0) -> str:
             "❌ Richiesta non valida.\n\n"
             "Per favore verifica i dati inseriti e riprova."
         )
+    if error_code == "UPSTREAM_HTTP_ERROR":
+        return (
+            "❌ Il servizio di pagamento ha restituito un errore.\n\n"
+            "Per favore riprova tra qualche istante."
+        )
+    if error_code == "UPSTREAM_INVALID_RESPONSE":
+        return (
+            "❌ Risposta non valida dal servizio di pagamento.\n\n"
+            "Per favore riprova tra qualche istante."
+        )
+    if error_code == "INTERNAL_ERROR":
+        return (
+            "❌ Errore interno del servizio.\n\n"
+            "Per favore riprova più tardi o contatta l'amministratore."
+        )
+    if error_code == "NOT_IMPLEMENTED":
+        return (
+            "⚠️ Il metodo di pagamento selezionato non è ancora disponibile.\n\n"
+            "Usa il metodo Carta oppure riprova più tardi."
+        )
+    # UNKNOWN_ERROR e qualsiasi codice non gestito esplicitamente
     return (
         "❌ Errore nel servizio di donazione.\n\n"
         "Per favore riprova più tardi."
